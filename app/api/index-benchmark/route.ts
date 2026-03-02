@@ -1,32 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
-import { timedQuery } from "@/lib/db";
+import { timedQuery, timedQueryRollback } from "@/lib/db";
 import pool from "@/lib/db";
+import { AVAILABLE_INDEXES } from "@/lib/function-indexes";
+import { functionQueries, procedureQueries } from "@/lib/equivalent-queries";
 
-// Known indexes from bank.sql
-export const AVAILABLE_INDEXES: Record<string, { table: string; column: string; ddl: string }> = {
-  idx_account_district: {
-    table: "fin_account",
-    column: "district_id",
-    ddl: "CREATE INDEX IF NOT EXISTS idx_account_district ON public.fin_account(district_id)",
-  },
-  idx_loan_account_id: {
-    table: "fin_loan",
-    column: "account_id",
-    ddl: "CREATE INDEX IF NOT EXISTS idx_loan_account_id ON public.fin_loan(account_id)",
-  },
-  idx_order_account_id: {
-    table: "fin_order",
-    column: "account_id",
-    ddl: "CREATE INDEX IF NOT EXISTS idx_order_account_id ON public.fin_order(account_id)",
-  },
-  idx_trans_account_id: {
-    table: "fin_trans",
-    column: "account_id",
-    ddl: "CREATE INDEX IF NOT EXISTS idx_trans_account_id ON public.fin_trans(account_id)",
-  },
-};
-
-// Representative query for each index
+// Legacy generic queries used by the standalone /index-benchmark page
 const INDEX_QUERIES: Record<string, { sql: string; params: unknown[] }> = {
   idx_account_district: {
     sql: "SELECT * FROM fin_account WHERE district_id = $1",
@@ -46,15 +24,38 @@ const INDEX_QUERIES: Record<string, { sql: string; params: unknown[] }> = {
   },
 };
 
+const avg = (arr: number[]) =>
+  arr.length > 0 ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+const round = (n: number) => Math.round(n * 100) / 100;
+
+function buildStats(timings: number[]) {
+  return {
+    timings: timings.map(round),
+    avg: round(avg(timings)),
+    min: round(Math.min(...timings)),
+    max: round(Math.max(...timings)),
+  };
+}
+
 export async function GET() {
   return NextResponse.json({ indexes: Object.keys(AVAILABLE_INDEXES) });
 }
 
 export async function POST(req: NextRequest) {
   const body = await req.json();
-  const { indexName, iterations = 5 } = body as {
+  const {
+    indexName,
+    iterations = 5,
+    // Integrated mode fields
+    type,
+    name,
+    params,
+  } = body as {
     indexName: string;
     iterations?: number;
+    type?: "function" | "procedure";
+    name?: string;
+    params?: unknown[];
   };
 
   const indexInfo = AVAILABLE_INDEXES[indexName];
@@ -62,33 +63,110 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: `Unknown index: ${indexName}` }, { status: 400 });
   }
 
-  const queryDef = INDEX_QUERIES[indexName];
   const runs = Math.min(Math.max(Math.round(iterations), 1), 50);
   const client = await pool.connect();
 
+  // ── INTEGRATED MODE: run actual function/procedure ──────────────────────────
+  if (type && name && params !== undefined) {
+    const isProc = type === "procedure";
+    const exec = isProc ? timedQueryRollback : timedQuery;
+
+    const placeholders = params.map((_, i) => `$${i + 1}`).join(", ");
+    const dbSql = isProc
+      ? `CALL ${name}(${placeholders})`
+      : `SELECT * FROM ${name}(${placeholders})`;
+
+    const queryMap = isProc ? procedureQueries : functionQueries;
+    const backendSql = queryMap[name]?.sql ?? null;
+
+    try {
+      // ── Phase 1: DROP index → chạy KHÔNG có index trước (cold cache) ──────────
+      await client.query(`DROP INDEX IF EXISTS ${indexName}`);
+
+      // WITHOUT index — db (cold)
+      const dbWithoutTimings: number[] = [];
+      for (let i = 0; i < runs; i++) {
+        const r = await exec(dbSql, params);
+        dbWithoutTimings.push(r.executionTimeMs);
+      }
+
+      // WITHOUT index — backend (cold)
+      const backendWithoutTimings: number[] = [];
+      if (backendSql) {
+        for (let i = 0; i < runs; i++) {
+          const r = await exec(backendSql, params);
+          backendWithoutTimings.push(r.executionTimeMs);
+        }
+      }
+
+      // ── Phase 2: CREATE index → chạy CÓ index sau (warm cache) ───────────────
+      await client.query(indexInfo.ddl);
+
+      // WITH index — db (warm)
+      const dbWithTimings: number[] = [];
+      for (let i = 0; i < runs; i++) {
+        const r = await exec(dbSql, params);
+        dbWithTimings.push(r.executionTimeMs);
+      }
+
+      // WITH index — backend (warm)
+      const backendWithTimings: number[] = [];
+      if (backendSql) {
+        for (let i = 0; i < runs; i++) {
+          const r = await exec(backendSql, params);
+          backendWithTimings.push(r.executionTimeMs);
+        }
+      }
+
+      return NextResponse.json({
+        indexName,
+        label: indexInfo.label,
+        table: indexInfo.table,
+        column: indexInfo.column,
+        iterations: runs,
+        db: {
+          withIndex: buildStats(dbWithTimings),
+          withoutIndex: buildStats(dbWithoutTimings),
+        },
+        backend: backendSql
+          ? {
+              withIndex: buildStats(backendWithTimings),
+              withoutIndex: buildStats(backendWithoutTimings),
+            }
+          : null,
+      });
+    } catch (err: unknown) {
+      await client.query(indexInfo.ddl).catch(() => {});
+      const message = err instanceof Error ? err.message : "Benchmark failed";
+      return NextResponse.json({ error: message }, { status: 500 });
+    } finally {
+      client.release();
+    }
+  }
+
+  // ── LEGACY MODE: generic representative query (for standalone page) ─────────
+  const queryDef = INDEX_QUERIES[indexName];
+  if (!queryDef) {
+    client.release();
+    return NextResponse.json({ error: `No query defined for index: ${indexName}` }, { status: 400 });
+  }
+
   try {
-    // Run WITH index first
     const withTimings: number[] = [];
     for (let i = 0; i < runs; i++) {
       const r = await timedQuery(queryDef.sql, queryDef.params);
       withTimings.push(r.executionTimeMs);
     }
 
-    // Temporarily drop the index
     await client.query(`DROP INDEX IF EXISTS ${indexName}`);
 
-    // Run WITHOUT index
     const withoutTimings: number[] = [];
     for (let i = 0; i < runs; i++) {
       const r = await timedQuery(queryDef.sql, queryDef.params);
       withoutTimings.push(r.executionTimeMs);
     }
 
-    // Restore the index
     await client.query(indexInfo.ddl);
-
-    const avg = (arr: number[]) => arr.reduce((a, b) => a + b, 0) / arr.length;
-    const round = (n: number) => Math.round(n * 100) / 100;
 
     return NextResponse.json({
       indexName,
@@ -96,21 +174,10 @@ export async function POST(req: NextRequest) {
       column: indexInfo.column,
       query: queryDef.sql,
       iterations: runs,
-      withIndex: {
-        timings: withTimings.map(round),
-        avg: round(avg(withTimings)),
-        min: round(Math.min(...withTimings)),
-        max: round(Math.max(...withTimings)),
-      },
-      withoutIndex: {
-        timings: withoutTimings.map(round),
-        avg: round(avg(withoutTimings)),
-        min: round(Math.min(...withoutTimings)),
-        max: round(Math.max(...withoutTimings)),
-      },
+      withIndex: buildStats(withTimings),
+      withoutIndex: buildStats(withoutTimings),
     });
   } catch (err: unknown) {
-    // Always restore index on error
     await client.query(indexInfo.ddl).catch(() => {});
     const message = err instanceof Error ? err.message : "Benchmark failed";
     return NextResponse.json({ error: message }, { status: 500 });

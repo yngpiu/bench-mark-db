@@ -17,6 +17,7 @@ import {
 import { DataTable } from "@/components/data-table";
 import { SparkLine } from "@/components/spark-line";
 import { getParamLabel } from "@/lib/vi-labels";
+import { AVAILABLE_INDEXES, FUNCTION_INDEXES } from "@/lib/function-indexes";
 import type { FunctionParam } from "@/lib/sql-parser";
 
 interface TimingStats {
@@ -34,6 +35,23 @@ interface ExecutionResult {
   timings: number[];
   stats: TimingStats;
   sql: string;
+}
+
+interface IndexTimingData {
+  timings: number[];
+  avg: number;
+  min: number;
+  max: number;
+}
+
+interface IndexBenchmarkResult {
+  indexName: string;
+  label: string;
+  table: string;
+  column: string;
+  iterations: number;
+  db: { withIndex: IndexTimingData; withoutIndex: IndexTimingData };
+  backend: { withIndex: IndexTimingData; withoutIndex: IndexTimingData } | null;
 }
 
 interface ConcurrentResult {
@@ -489,6 +507,34 @@ export function BenchmarkPanel({
         )}
       </section>
 
+      {/* Index benchmark section */}
+      {(FUNCTION_INDEXES[name] ?? []).length > 0 && (
+        <section className="space-y-3">
+          <div>
+            <h3 className="text-sm font-semibold">Ảnh hưởng của Index</h3>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              Tự động DROP index, đo hiệu năng thực tế trên hàm/thủ tục này, rồi khôi phục lại
+            </p>
+          </div>
+          <div className="space-y-3">
+            {(FUNCTION_INDEXES[name] ?? []).map((indexName) => (
+              <IndexBenchmarkCard
+                key={indexName}
+                indexName={indexName}
+                indexInfo={AVAILABLE_INDEXES[indexName]}
+                type={type}
+                name={name}
+                getParams={buildParams}
+                iterations={iterations}
+                allRequiredFilled={allRequiredFilled}
+                tab1Label={tab1Label}
+                tab2Label={tab2Label}
+              />
+            ))}
+          </div>
+        </section>
+      )}
+
       {/* Concurrent load test section */}
       <section className="space-y-3">
         <div className="flex items-center gap-3 flex-wrap">
@@ -692,6 +738,186 @@ function ExplainPanel({ label, plan }: { label: string; plan: unknown[] | null }
       <div className="text-sm font-medium">{label}</div>
       <div className="text-[10px] text-muted-foreground">Thời gian thực / ước tính · dòng thực / ước tính · cost</div>
       <ExplainNode node={root} />
+    </div>
+  );
+}
+
+function IndexBenchmarkCard({
+  indexName,
+  indexInfo,
+  type,
+  name,
+  getParams,
+  iterations,
+  allRequiredFilled,
+  tab1Label,
+  tab2Label,
+}: {
+  indexName: string;
+  indexInfo: { table: string; column: string; label: string };
+  type: "function" | "procedure";
+  name: string;
+  getParams: () => (string | null)[];
+  iterations: number;
+  allRequiredFilled: boolean;
+  tab1Label: string;
+  tab2Label: string;
+}) {
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState<IndexBenchmarkResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const run = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    setResult(null);
+    try {
+      const res = await fetch("/api/index-benchmark", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ indexName, type, name, params: getParams(), iterations }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.error || "Benchmark thất bại");
+        return;
+      }
+      setResult(data);
+    } catch {
+      setError("Lỗi kết nối");
+    } finally {
+      setLoading(false);
+    }
+  }, [indexName, type, name, getParams, iterations]);
+
+  return (
+    <div className="rounded-xl border p-4 space-y-4">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="text-sm font-medium">{indexInfo.label}</div>
+          <div className="text-[11px] text-muted-foreground font-mono mt-0.5">
+            {indexName} → {indexInfo.table}.{indexInfo.column}
+          </div>
+        </div>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={run}
+          disabled={loading || !allRequiredFilled}
+          title={!allRequiredFilled ? "Nhập tham số trước — nhấn Chạy cả hai để mở modal" : ""}
+        >
+          {loading ? "Đang benchmark..." : "Chạy benchmark Index"}
+        </Button>
+      </div>
+
+      {!allRequiredFilled && (
+        <p className="text-[11px] text-muted-foreground">
+          Nhấn &ldquo;Chạy cả hai&rdquo; phía trên để nhập tham số trước, sau đó chạy benchmark index.
+        </p>
+      )}
+
+      {loading && (
+        <div className="rounded-lg bg-muted/30 p-3 text-xs text-center text-muted-foreground animate-pulse">
+          Đo không có index trước (cold) → tạo index → đo có index (warm)... ({iterations}×2 lần chạy)
+        </div>
+      )}
+
+      {error && (
+        <div className="rounded-lg bg-destructive/10 p-3 text-xs text-destructive">{error}</div>
+      )}
+
+      {result && (
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-1.5">
+              <div className="text-xs font-medium">{tab1Label}</div>
+              <IndexTimingCompare
+                withData={result.db.withIndex}
+                withoutData={result.db.withoutIndex}
+              />
+            </div>
+            {result.backend && (
+              <div className="space-y-1.5">
+                <div className="text-xs font-medium">{tab2Label}</div>
+                <IndexTimingCompare
+                  withData={result.backend.withIndex}
+                  withoutData={result.backend.withoutIndex}
+                />
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function IndexTimingCompare({
+  withData,
+  withoutData,
+}: {
+  withData: IndexTimingData;
+  withoutData: IndexTimingData;
+}) {
+  const maxMs = Math.max(withData.avg, withoutData.avg);
+  const indexFaster = withData.avg < withoutData.avg;
+  const speedup =
+    withoutData.avg > 0 ? ((withoutData.avg - withData.avg) / withoutData.avg) * 100 : 0;
+
+  // Thanh nào dài hơn (chậm hơn) → xanh; thanh nào ngắn hơn (nhanh hơn) → đỏ
+  const withIsSlow = withData.avg < withoutData.avg;
+  const entries = [
+    {
+      label: "Có index",
+      data: withData,
+      barColor: withIsSlow ? "bg-green-500" : "bg-red-400",
+      textColor: withIsSlow ? "text-green-600" : "text-red-500",
+      sparkColor: withIsSlow ? "rgb(34,197,94)" : "rgb(239,68,68)",
+    },
+    {
+      label: "Không có index",
+      data: withoutData,
+      barColor: withIsSlow ? "bg-red-400" : "bg-green-500",
+      textColor: withIsSlow ? "text-red-500" : "text-green-600",
+      sparkColor: withIsSlow ? "rgb(239,68,68)" : "rgb(34,197,94)",
+    },
+  ];
+
+  return (
+    <div className="space-y-2">
+      {/* Bars */}
+      {entries.map(({ label, data, barColor, textColor }) => (
+        <div key={label}>
+          <div className="flex justify-between text-[10px] text-muted-foreground mb-0.5">
+            <span>{label}</span>
+            <span className={`font-mono font-semibold ${textColor}`}>{data.avg.toFixed(2)} ms</span>
+          </div>
+          <div className="h-2 bg-muted rounded-full overflow-hidden">
+            <div
+              className={`h-full rounded-full ${barColor}`}
+              style={{ width: `${maxMs > 0 ? (data.avg / maxMs) * 100 : 0}%` }}
+            />
+          </div>
+        </div>
+      ))}
+
+      {/* Sparklines */}
+      {withData.timings.length > 1 && (
+        <div className="grid grid-cols-2 gap-2 pt-1">
+          <SparkLine data={withData.timings} color={entries[0].sparkColor} height={36} showDots={false} />
+          <SparkLine data={withoutData.timings} color={entries[1].sparkColor} height={36} showDots={false} />
+        </div>
+      )}
+
+      {/* Verdict */}
+      <Badge
+        variant={indexFaster ? "default" : "secondary"}
+        className="text-[10px] font-normal"
+      >
+        {indexFaster
+          ? `Index nhanh hơn ${speedup.toFixed(1)}%`
+          : `Index không có tác dụng rõ rệt (${Math.abs(speedup).toFixed(1)}%)`}
+      </Badge>
     </div>
   );
 }

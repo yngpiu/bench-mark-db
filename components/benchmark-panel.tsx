@@ -17,7 +17,7 @@ import {
 import { DataTable } from "@/components/data-table";
 import { SparkLine } from "@/components/spark-line";
 import { getParamLabel } from "@/lib/vi-labels";
-import { AVAILABLE_INDEXES, FUNCTION_INDEXES } from "@/lib/function-indexes";
+import { FUNCTION_INDEXES } from "@/lib/function-indexes";
 import type { FunctionParam } from "@/lib/sql-parser";
 
 interface TimingStats {
@@ -25,6 +25,12 @@ interface TimingStats {
   avg: number;
   min: number;
   max: number;
+}
+
+interface IndexComparisonData {
+  withIndex: { timings: number[]; avg: number; min: number; max: number };
+  withoutIndex: { timings: number[]; avg: number; min: number; max: number };
+  indexes: string[];
 }
 
 interface ExecutionResult {
@@ -35,6 +41,7 @@ interface ExecutionResult {
   timings: number[];
   stats: TimingStats;
   sql: string;
+  indexComparison?: IndexComparisonData;
 }
 
 interface IndexTimingData {
@@ -42,16 +49,6 @@ interface IndexTimingData {
   avg: number;
   min: number;
   max: number;
-}
-
-interface IndexBenchmarkResult {
-  indexName: string;
-  label: string;
-  table: string;
-  column: string;
-  iterations: number;
-  db: { withIndex: IndexTimingData; withoutIndex: IndexTimingData };
-  backend: { withIndex: IndexTimingData; withoutIndex: IndexTimingData } | null;
 }
 
 interface ConcurrentResult {
@@ -119,7 +116,7 @@ export function BenchmarkPanel({
   const [concurrentResults, setConcurrentResults] = useState<ConcurrentResult[]>([]);
   const [concurrentLoading, setConcurrentLoading] = useState(false);
 
-  const pendingActionRef = useRef<"db" | "backend" | "both" | null>(null);
+  const pendingActionRef = useRef<"db" | "backend" | "both" | "concurrent" | null>(null);
   const hasParams = params.length > 0;
 
   const transIdParams = params.filter((p) => p.name.includes("trans_id"));
@@ -162,17 +159,20 @@ export function BenchmarkPanel({
       setResult(null);
 
       try {
-        const res = await fetch("/api/execute", {
+        const relatedIndexes = FUNCTION_INDEXES[name] ?? [];
+        const res = await fetch("/api/execute-full", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ type, name, params: buildParams(), mode, iterations }),
+          body: JSON.stringify({ type, name, params: buildParams(), mode, iterations, relatedIndexes }),
         });
         const data = await res.json();
         if (!res.ok) {
           setError(data.error || "Thực thi thất bại");
           return;
         }
-        setResult(data);
+        const result = mode === "db" ? data.db : data.backend;
+        if (result) setResult(result);
+        else setError("Không có kết quả");
       } catch {
         setError("Lỗi kết nối mạng");
       } finally {
@@ -184,9 +184,32 @@ export function BenchmarkPanel({
 
   const executeBoth = useCallback(async () => {
     setBothLoading(true);
-    await Promise.all([executeMode("db"), executeMode("backend")]);
-    setBothLoading(false);
-  }, [executeMode]);
+    setDbError(null);
+    setBackendError(null);
+    setDbResult(null);
+    setBackendResult(null);
+    try {
+      const relatedIndexes = FUNCTION_INDEXES[name] ?? [];
+      const res = await fetch("/api/execute-full", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type, name, params: buildParams(), iterations, relatedIndexes }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setDbError(data.error || "Thực thi thất bại");
+        setBackendError(data.error || "Thực thi thất bại");
+        return;
+      }
+      if (data.db) setDbResult(data.db);
+      if (data.backend) setBackendResult(data.backend);
+    } catch {
+      setDbError("Lỗi kết nối mạng");
+      setBackendError("Lỗi kết nối mạng");
+    } finally {
+      setBothLoading(false);
+    }
+  }, [type, name, buildParams, iterations]);
 
   const tryExecute = useCallback(
     (action: "db" | "backend" | "both") => {
@@ -200,14 +223,6 @@ export function BenchmarkPanel({
     },
     [hasParams, executeBoth, executeMode]
   );
-
-  const handleDialogConfirm = useCallback(() => {
-    setDialogOpen(false);
-    const action = pendingActionRef.current;
-    pendingActionRef.current = null;
-    if (action === "both") executeBoth();
-    else if (action) executeMode(action);
-  }, [executeBoth, executeMode]);
 
   // Fetch EXPLAIN plans for both modes
   const fetchExplain = useCallback(async () => {
@@ -285,6 +300,15 @@ export function BenchmarkPanel({
     setConcurrentResults([r1, r2]);
     setConcurrentLoading(false);
   }, [type, name, buildParams, concurrency]);
+
+  const handleDialogConfirm = useCallback(() => {
+    setDialogOpen(false);
+    const action = pendingActionRef.current;
+    pendingActionRef.current = null;
+    if (action === "concurrent") runConcurrent();
+    else if (action === "both") executeBoth();
+    else if (action) executeMode(action);
+  }, [executeBoth, executeMode, runConcurrent]);
 
   const timeDiff =
     dbResult && backendResult ? backendResult.stats.avg - dbResult.stats.avg : null;
@@ -397,7 +421,11 @@ export function BenchmarkPanel({
         </div>
 
         <Button onClick={() => tryExecute("both")} disabled={bothLoading} size="lg">
-          {bothLoading ? `Đang chạy (${iterations} lần)...` : `Chạy cả hai ×${iterations}`}
+          {bothLoading
+            ? (FUNCTION_INDEXES[name] ?? []).length > 0
+              ? `Đang benchmark (không index → có index, ×${iterations})...`
+              : `Đang chạy (${iterations} lần)...`
+            : `Chạy cả hai ×${iterations}`}
         </Button>
         <Button onClick={() => tryExecute("db")} disabled={dbLoading} variant="outline" size="sm">
           {dbLoading ? "..." : tab1Label}
@@ -507,34 +535,6 @@ export function BenchmarkPanel({
         )}
       </section>
 
-      {/* Index benchmark section */}
-      {(FUNCTION_INDEXES[name] ?? []).length > 0 && (
-        <section className="space-y-3">
-          <div>
-            <h3 className="text-sm font-semibold">Ảnh hưởng của Index</h3>
-            <p className="text-xs text-muted-foreground mt-0.5">
-              Tự động DROP index, đo hiệu năng thực tế trên hàm/thủ tục này, rồi khôi phục lại
-            </p>
-          </div>
-          <div className="space-y-3">
-            {(FUNCTION_INDEXES[name] ?? []).map((indexName) => (
-              <IndexBenchmarkCard
-                key={indexName}
-                indexName={indexName}
-                indexInfo={AVAILABLE_INDEXES[indexName]}
-                type={type}
-                name={name}
-                getParams={buildParams}
-                iterations={iterations}
-                allRequiredFilled={allRequiredFilled}
-                tab1Label={tab1Label}
-                tab2Label={tab2Label}
-              />
-            ))}
-          </div>
-        </section>
-      )}
-
       {/* Concurrent load test section */}
       <section className="space-y-3">
         <div className="flex items-center gap-3 flex-wrap">
@@ -556,7 +556,7 @@ export function BenchmarkPanel({
           <Button
             size="sm"
             variant="outline"
-            onClick={hasParams ? () => { pendingActionRef.current = null; setDialogOpen(true); setTimeout(runConcurrent, 500); } : runConcurrent}
+            onClick={hasParams ? () => { pendingActionRef.current = "concurrent"; setDialogOpen(true); } : runConcurrent}
             disabled={concurrentLoading}
           >
             {concurrentLoading ? `Đang gửi ${concurrency} request...` : `Gửi ${concurrency} request đồng thời`}
@@ -645,6 +645,22 @@ function ResultPanel({ result, error, loading, returnDesc }: {
             data={result.timings}
             color={result.fields.length === 0 ? "rgb(168,85,247)" : "rgb(59,130,246)"}
             height={56}
+          />
+        </div>
+      )}
+
+      {/* Index comparison — shown when executeBoth ran the full index cycle */}
+      {result.indexComparison && (
+        <div className="rounded-lg border p-3 space-y-2">
+          <div className="text-xs font-medium">
+            Ảnh hưởng Index:{" "}
+            <span className="text-muted-foreground font-normal">
+              {result.indexComparison.indexes.join(", ")}
+            </span>
+          </div>
+          <IndexTimingCompare
+            withData={result.indexComparison.withIndex}
+            withoutData={result.indexComparison.withoutIndex}
           />
         </div>
       )}
@@ -742,115 +758,6 @@ function ExplainPanel({ label, plan }: { label: string; plan: unknown[] | null }
   );
 }
 
-function IndexBenchmarkCard({
-  indexName,
-  indexInfo,
-  type,
-  name,
-  getParams,
-  iterations,
-  allRequiredFilled,
-  tab1Label,
-  tab2Label,
-}: {
-  indexName: string;
-  indexInfo: { table: string; column: string; label: string };
-  type: "function" | "procedure";
-  name: string;
-  getParams: () => (string | null)[];
-  iterations: number;
-  allRequiredFilled: boolean;
-  tab1Label: string;
-  tab2Label: string;
-}) {
-  const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<IndexBenchmarkResult | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  const run = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    setResult(null);
-    try {
-      const res = await fetch("/api/index-benchmark", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ indexName, type, name, params: getParams(), iterations }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data.error || "Benchmark thất bại");
-        return;
-      }
-      setResult(data);
-    } catch {
-      setError("Lỗi kết nối");
-    } finally {
-      setLoading(false);
-    }
-  }, [indexName, type, name, getParams, iterations]);
-
-  return (
-    <div className="rounded-xl border p-4 space-y-4">
-      <div className="flex items-center justify-between gap-3">
-        <div>
-          <div className="text-sm font-medium">{indexInfo.label}</div>
-          <div className="text-[11px] text-muted-foreground font-mono mt-0.5">
-            {indexName} → {indexInfo.table}.{indexInfo.column}
-          </div>
-        </div>
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={run}
-          disabled={loading || !allRequiredFilled}
-          title={!allRequiredFilled ? "Nhập tham số trước — nhấn Chạy cả hai để mở modal" : ""}
-        >
-          {loading ? "Đang benchmark..." : "Chạy benchmark Index"}
-        </Button>
-      </div>
-
-      {!allRequiredFilled && (
-        <p className="text-[11px] text-muted-foreground">
-          Nhấn &ldquo;Chạy cả hai&rdquo; phía trên để nhập tham số trước, sau đó chạy benchmark index.
-        </p>
-      )}
-
-      {loading && (
-        <div className="rounded-lg bg-muted/30 p-3 text-xs text-center text-muted-foreground animate-pulse">
-          Đo không có index trước (cold) → tạo index → đo có index (warm)... ({iterations}×2 lần chạy)
-        </div>
-      )}
-
-      {error && (
-        <div className="rounded-lg bg-destructive/10 p-3 text-xs text-destructive">{error}</div>
-      )}
-
-      {result && (
-        <div className="space-y-4">
-          <div className="grid grid-cols-2 gap-4">
-            <div className="space-y-1.5">
-              <div className="text-xs font-medium">{tab1Label}</div>
-              <IndexTimingCompare
-                withData={result.db.withIndex}
-                withoutData={result.db.withoutIndex}
-              />
-            </div>
-            {result.backend && (
-              <div className="space-y-1.5">
-                <div className="text-xs font-medium">{tab2Label}</div>
-                <IndexTimingCompare
-                  withData={result.backend.withIndex}
-                  withoutData={result.backend.withoutIndex}
-                />
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
 
 function IndexTimingCompare({
   withData,

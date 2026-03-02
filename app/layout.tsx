@@ -1,23 +1,23 @@
 import type { Metadata } from "next";
-import { Roboto, Geist_Mono } from "next/font/google";
+import { Roboto, Roboto_Mono } from "next/font/google";
 import "./globals.css";
 import { AppSidebar } from "@/components/app-sidebar";
-import { getTables, getFunctions, getProcedures } from "@/lib/schema";
+import { getFunctions, getProcedures } from "@/lib/schema";
 import {
-  tableLabels,
   functionDescriptions,
   procedureDescriptions,
 } from "@/lib/vi-labels";
 
 const roboto = Roboto({
-  variable: "--font-geist-sans",
+  variable: "--font-sans-var",
   subsets: ["latin"],
   weight: ["400", "500", "700"],
 });
 
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
+const robotoMono = Roboto_Mono({
+  variable: "--font-mono-var",
   subsets: ["latin"],
+  weight: ["400", "500", "600", "700"],
 });
 
 export const metadata: Metadata = {
@@ -30,20 +30,13 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
-  const tables = getTables();
   const functions = getFunctions();
   const procedures = getProcedures();
 
   const sections = [
     {
       title: "Lược đồ",
-      items: [
-        { label: "Sơ đồ ER", href: "/" },
-        ...tables.map((t) => ({
-          label: tableLabels[t.name] ?? t.name,
-          href: `/#${t.name}`,
-        })),
-      ],
+      items: [{ label: "Sơ đồ ER", href: "/" }],
     },
     {
       title: "Hàm (Functions)",
@@ -59,12 +52,19 @@ export default function RootLayout({
         href: `/procedures/${p.name}`,
       })),
     },
+    {
+      title: "Công cụ nâng cao",
+      items: [
+        { label: "Benchmark Index", href: "/index-benchmark" },
+        { label: "Kiểm tra quy mô dữ liệu", href: "/scale-test" },
+      ],
+    },
   ];
 
   return (
     <html lang="vi">
       <body
-        className={`${roboto.variable} ${geistMono.variable} antialiased`}
+        className={`${roboto.variable} ${robotoMono.variable} antialiased`}
       >
         <div className="flex min-h-screen">
           <AppSidebar sections={sections} />

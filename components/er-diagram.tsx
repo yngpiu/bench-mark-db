@@ -1,10 +1,13 @@
 "use client";
 
+import { useMemo } from "react";
 import {
   ReactFlow,
   Background,
   Controls,
   MiniMap,
+  useNodesState,
+  useEdgesState,
   type Node,
   type Edge,
   Handle,
@@ -13,14 +16,13 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import type { Table } from "@/lib/sql-parser";
-import { tableLabels, getColumnLabel } from "@/lib/vi-labels";
+import { tableLabels } from "@/lib/vi-labels";
 
 interface TableNodeData {
   label: string;
   viLabel: string;
   columns: {
     name: string;
-    viName: string;
     type: string;
     isPrimaryKey: boolean;
     isForeignKey: boolean;
@@ -64,7 +66,7 @@ function TableNode({ data }: { data: TableNodeData }) {
                     : "text-foreground"
                 }
               >
-                {col.viName}
+                {col.name}
               </span>
             </span>
             <span className="text-muted-foreground font-mono">{col.type}</span>
@@ -106,7 +108,6 @@ function layoutTables(tables: Table[]) {
         viLabel: tableLabels[table.name] ?? table.name,
         columns: table.columns.map((col) => ({
           name: col.name,
-          viName: getColumnLabel(col.name),
           type: col.type
             .replace(/character varying\((\d+)\)/i, "varchar($1)")
             .replace(/character\((\d+)\)/i, "char($1)")
@@ -130,7 +131,7 @@ function layoutTables(tables: Table[]) {
         type: "smoothstep",
         animated: true,
         style: { stroke: "#6366f1", strokeWidth: 2 },
-        label: getColumnLabel(fk.column),
+        label: fk.column,
         labelStyle: { fontSize: 10, fill: "#6366f1" },
         labelBgStyle: { fill: "white", fillOpacity: 0.8 },
       });
@@ -145,13 +146,20 @@ interface ErDiagramProps {
 }
 
 export function ErDiagram({ tables }: ErDiagramProps) {
-  const { nodes, edges } = layoutTables(tables);
+  const { nodes: initialNodes, edges: initialEdges } = useMemo(
+    () => layoutTables(tables),
+    [tables]
+  );
+  const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
+  const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
   return (
     <div className="h-[calc(100vh-4rem)] w-full">
       <ReactFlow
         nodes={nodes}
         edges={edges}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
         nodeTypes={nodeTypes}
         fitView
         fitViewOptions={{ padding: 0.2 }}

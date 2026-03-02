@@ -46,8 +46,8 @@ export function FunctionPageClient({
           params={params}
           defaults={defaults}
           returnDesc={returnDesc}
-          tab1Label="Gọi hàm DB"
-          tab2Label="Truy vấn Backend"
+          tab1Label="Gọi hàm từ DB"
+          tab2Label="Truy vấn từ Backend"
         />
       </div>
     </div>

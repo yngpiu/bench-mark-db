@@ -44,7 +44,7 @@ export function ProcedurePageClient({
           params={params}
           defaults={defaults}
           tab1Label="Gọi thủ tục DB"
-          tab2Label="Truy vấn Backend"
+          tab2Label="Truy vấn từ Backend"
         />
       </div>
     </div>

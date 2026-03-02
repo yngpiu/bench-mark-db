@@ -15,6 +15,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { DataTable } from "@/components/data-table";
+import { SparkLine } from "@/components/spark-line";
 import { getParamLabel } from "@/lib/vi-labels";
 import type { FunctionParam } from "@/lib/sql-parser";
 
@@ -33,6 +34,18 @@ interface ExecutionResult {
   timings: number[];
   stats: TimingStats;
   sql: string;
+}
+
+interface ConcurrentResult {
+  mode: "db" | "backend";
+  concurrency: number;
+  totalMs: number;
+  throughput: number; // req/s
+  timings: number[];
+  p50: number;
+  p95: number;
+  p99: number;
+  errors: number;
 }
 
 interface BenchmarkPanelProps {
@@ -69,16 +82,24 @@ export function BenchmarkPanel({
   });
   const [dialogOpen, setDialogOpen] = useState(false);
   const [iterations, setIterations] = useState(5);
+  const [concurrency, setConcurrency] = useState(10);
 
   const [dbResult, setDbResult] = useState<ExecutionResult | null>(null);
-  const [backendResult, setBackendResult] = useState<ExecutionResult | null>(
-    null
-  );
+  const [backendResult, setBackendResult] = useState<ExecutionResult | null>(null);
   const [dbError, setDbError] = useState<string | null>(null);
   const [backendError, setBackendError] = useState<string | null>(null);
   const [dbLoading, setDbLoading] = useState(false);
   const [backendLoading, setBackendLoading] = useState(false);
   const [bothLoading, setBothLoading] = useState(false);
+
+  // Explain plan state
+  const [explainDb, setExplainDb] = useState<unknown[] | null>(null);
+  const [explainBackend, setExplainBackend] = useState<unknown[] | null>(null);
+  const [explainLoading, setExplainLoading] = useState(false);
+
+  // Concurrent load state
+  const [concurrentResults, setConcurrentResults] = useState<ConcurrentResult[]>([]);
+  const [concurrentLoading, setConcurrentLoading] = useState(false);
 
   const pendingActionRef = useRef<"db" | "backend" | "both" | null>(null);
   const hasParams = params.length > 0;
@@ -126,13 +147,7 @@ export function BenchmarkPanel({
         const res = await fetch("/api/execute", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            type,
-            name,
-            params: buildParams(),
-            mode,
-            iterations,
-          }),
+          body: JSON.stringify({ type, name, params: buildParams(), mode, iterations }),
         });
         const data = await res.json();
         if (!res.ok) {
@@ -176,10 +191,85 @@ export function BenchmarkPanel({
     else if (action) executeMode(action);
   }, [executeBoth, executeMode]);
 
+  // Fetch EXPLAIN plans for both modes
+  const fetchExplain = useCallback(async () => {
+    setExplainLoading(true);
+    setExplainDb(null);
+    setExplainBackend(null);
+    try {
+      const [r1, r2] = await Promise.all([
+        fetch("/api/explain", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type, name, params: buildParams(), mode: "db" }),
+        }),
+        fetch("/api/explain", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type, name, params: buildParams(), mode: "backend" }),
+        }),
+      ]);
+      const [d1, d2] = await Promise.all([r1.json(), r2.json()]);
+      if (d1.plan) setExplainDb(d1.plan);
+      if (d2.plan) setExplainBackend(d2.plan);
+    } catch {
+      // ignore
+    } finally {
+      setExplainLoading(false);
+    }
+  }, [type, name, buildParams]);
+
+  // Concurrent load test — fire N requests simultaneously from the client
+  const runConcurrent = useCallback(async () => {
+    setConcurrentLoading(true);
+    setConcurrentResults([]);
+    const builtParams = buildParams();
+
+    const runMode = async (mode: "db" | "backend"): Promise<ConcurrentResult> => {
+      const start = performance.now();
+      let errors = 0;
+      const timings: number[] = [];
+
+      const requests = Array.from({ length: concurrency }, async () => {
+        const t0 = performance.now();
+        try {
+          const res = await fetch("/api/execute", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ type, name, params: builtParams, mode, iterations: 1 }),
+          });
+          if (!res.ok) errors++;
+          else timings.push(performance.now() - t0);
+        } catch {
+          errors++;
+        }
+      });
+
+      await Promise.all(requests);
+      const totalMs = performance.now() - start;
+      const sorted = [...timings].sort((a, b) => a - b);
+      const p = (pct: number) => sorted[Math.min(Math.floor((sorted.length * pct) / 100), sorted.length - 1)] ?? 0;
+
+      return {
+        mode,
+        concurrency,
+        totalMs: Math.round(totalMs * 100) / 100,
+        throughput: Math.round((timings.length / (totalMs / 1000)) * 10) / 10,
+        timings: timings.map((t) => Math.round(t * 100) / 100),
+        p50: Math.round(p(50) * 100) / 100,
+        p95: Math.round(p(95) * 100) / 100,
+        p99: Math.round(p(99) * 100) / 100,
+        errors,
+      };
+    };
+
+    const [r1, r2] = await Promise.all([runMode("db"), runMode("backend")]);
+    setConcurrentResults([r1, r2]);
+    setConcurrentLoading(false);
+  }, [type, name, buildParams, concurrency]);
+
   const timeDiff =
-    dbResult && backendResult
-      ? backendResult.stats.avg - dbResult.stats.avg
-      : null;
+    dbResult && backendResult ? backendResult.stats.avg - dbResult.stats.avg : null;
 
   const filledCount = params.filter((p) => {
     const v = values[p.name];
@@ -194,7 +284,7 @@ export function BenchmarkPanel({
 
   return (
     <div className="space-y-6">
-      {/* Param modal — opens automatically when user clicks any run button */}
+      {/* Param modal */}
       {hasParams && (
         <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
           <DialogContent className="sm:max-w-lg">
@@ -208,52 +298,39 @@ export function BenchmarkPanel({
             </DialogHeader>
             <div className="grid gap-4 py-2 px-1 max-h-[60vh] overflow-y-auto">
               {params.map((p) => {
-                  const viLabel = getParamLabel(p.name);
-                  const isRequired = !p.defaultValue;
-                  const isEmpty =
-                    values[p.name] === "" || values[p.name] === undefined;
-                  return (
-                    <div key={p.name} className="grid gap-1.5">
-                      <Label
-                        htmlFor={`param-${p.name}`}
-                        className="text-sm flex items-center gap-1.5"
-                      >
-                        <span className="font-semibold">{viLabel}</span>
-                        {isRequired && (
-                          <span className="text-destructive">*</span>
-                        )}
-                      <Badge
-                        variant="secondary"
-                        className="font-mono text-[10px] px-1.5 py-0 font-normal opacity-90"
-                      >
+                const viLabel = getParamLabel(p.name);
+                const isRequired = !p.defaultValue;
+                const isEmpty = values[p.name] === "" || values[p.name] === undefined;
+                return (
+                  <div key={p.name} className="grid gap-1.5">
+                    <Label
+                      htmlFor={`param-${p.name}`}
+                      className="text-sm flex items-center gap-1.5"
+                    >
+                      <span className="font-semibold">{viLabel}</span>
+                      {isRequired && <span className="text-destructive">*</span>}
+                      <Badge variant="secondary" className="font-mono text-[10px] px-1.5 py-0 font-normal opacity-90">
                         {p.type}
                       </Badge>
                       {p.mode && (
-                        <Badge
-                          variant="secondary"
-                          className="text-[10px] px-1.5 py-0 font-normal opacity-75"
-                        >
+                        <Badge variant="secondary" className="text-[10px] px-1.5 py-0 font-normal opacity-75">
                           {p.mode}
                         </Badge>
                       )}
                     </Label>
-                      <Input
-                        id={`param-${p.name}`}
-                        value={values[p.name] ?? ""}
-                        onChange={(e) =>
-                          setValues((prev) => ({
-                            ...prev,
-                            [p.name]: e.target.value,
-                          }))
-                        }
-                        placeholder={
-                          defaults[p.name]
-                            ? `Gợi ý: ${defaults[p.name]}`
-                            : p.defaultValue
-                              ? `Mặc định: ${p.defaultValue}`
-                              : `Nhập ${viLabel.toLowerCase()}...`
-                        }
-                      />
+                    <Input
+                      id={`param-${p.name}`}
+                      value={values[p.name] ?? ""}
+                      onChange={(e) => setValues((prev) => ({ ...prev, [p.name]: e.target.value }))}
+                      placeholder={
+                        defaults[p.name]
+                          ? `Gợi ý: ${defaults[p.name]}`
+                          : p.defaultValue
+                            ? `Mặc định: ${p.defaultValue}`
+                            : `Nhập ${viLabel.toLowerCase()}...`
+                      }
+                      className={isRequired && isEmpty ? "border-destructive focus-visible:ring-destructive" : ""}
+                    />
                   </div>
                 );
               })}
@@ -261,11 +338,7 @@ export function BenchmarkPanel({
             <DialogFooter>
               <Button
                 variant="outline"
-                onClick={() => {
-                  setValues(
-                    Object.fromEntries(params.map((p) => [p.name, ""]))
-                  );
-                }}
+                onClick={() => setValues(Object.fromEntries(params.map((p) => [p.name, ""])))}
               >
                 Xóa tất cả
               </Button>
@@ -273,18 +346,13 @@ export function BenchmarkPanel({
                 variant="outline"
                 onClick={() => {
                   const reset: Record<string, string> = {};
-                  for (const p of params) {
-                    reset[p.name] = defaults[p.name] ?? "";
-                  }
+                  for (const p of params) reset[p.name] = defaults[p.name] ?? "";
                   setValues(reset);
                 }}
               >
                 Mặc định
               </Button>
-              <Button
-                onClick={handleDialogConfirm}
-                disabled={!allRequiredFilled}
-              >
+              <Button onClick={handleDialogConfirm} disabled={!allRequiredFilled}>
                 Xác nhận & Chạy
               </Button>
             </DialogFooter>
@@ -294,11 +362,8 @@ export function BenchmarkPanel({
 
       {/* Controls row */}
       <div className="flex items-center gap-3 flex-wrap">
-        {/* Iteration count selector */}
         <div className="flex items-center gap-1.5">
-          <Label htmlFor="iter-count" className="text-sm whitespace-nowrap">
-            Số lần chạy:
-          </Label>
+          <Label htmlFor="iter-count" className="text-sm whitespace-nowrap">Số lần chạy:</Label>
           <Input
             id="iter-count"
             type="number"
@@ -313,29 +378,13 @@ export function BenchmarkPanel({
           />
         </div>
 
-        <Button
-          onClick={() => tryExecute("both")}
-          disabled={bothLoading}
-          size="lg"
-        >
-          {bothLoading
-            ? `Đang chạy (${iterations} lần)...`
-            : `Chạy cả hai ×${iterations}`}
+        <Button onClick={() => tryExecute("both")} disabled={bothLoading} size="lg">
+          {bothLoading ? `Đang chạy (${iterations} lần)...` : `Chạy cả hai ×${iterations}`}
         </Button>
-        <Button
-          onClick={() => tryExecute("db")}
-          disabled={dbLoading}
-          variant="outline"
-          size="sm"
-        >
+        <Button onClick={() => tryExecute("db")} disabled={dbLoading} variant="outline" size="sm">
           {dbLoading ? "..." : tab1Label}
         </Button>
-        <Button
-          onClick={() => tryExecute("backend")}
-          disabled={backendLoading}
-          variant="outline"
-          size="sm"
-        >
+        <Button onClick={() => tryExecute("backend")} disabled={backendLoading} variant="outline" size="sm">
           {backendLoading ? "..." : tab2Label}
         </Button>
       </div>
@@ -369,9 +418,7 @@ export function BenchmarkPanel({
             </h3>
             {timeDiff !== null && (
               <Badge variant={timeDiff > 0 ? "default" : "secondary"}>
-                {tab1Label}{" "}
-                {timeDiff > 0 ? "nhanh hơn" : "chậm hơn"}{" "}
-                {Math.abs(timeDiff).toFixed(2)} ms
+                {tab1Label} {timeDiff > 0 ? "nhanh hơn" : "chậm hơn"} {Math.abs(timeDiff).toFixed(2)} ms
               </Badge>
             )}
           </div>
@@ -380,28 +427,25 @@ export function BenchmarkPanel({
               label={tab1Label}
               stats={dbResult.stats}
               maxMs={Math.max(dbResult.stats.avg, backendResult.stats.avg)}
-              variant="db"
+              isFaster={dbResult.stats.avg < backendResult.stats.avg}
             />
             <TimingBar
               label={tab2Label}
               stats={backendResult.stats}
               maxMs={Math.max(dbResult.stats.avg, backendResult.stats.avg)}
-              variant="backend"
+              isFaster={backendResult.stats.avg < dbResult.stats.avg}
             />
           </div>
         </div>
       )}
 
-      {/* Result tabs */}
+      {/* Main result tabs */}
       <Tabs defaultValue="db" className="space-y-4">
-        <TabsList variant="line">
+        <TabsList>
           <TabsTrigger value="db" className="gap-2">
             {tab1Label}
             {dbResult && (
-              <Badge
-                variant="secondary"
-                className="text-[10px] px-1.5 py-0"
-              >
+              <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
                 TB {dbResult.stats.avg.toFixed(2)} ms
               </Badge>
             )}
@@ -409,10 +453,7 @@ export function BenchmarkPanel({
           <TabsTrigger value="backend" className="gap-2">
             {tab2Label}
             {backendResult && (
-              <Badge
-                variant="secondary"
-                className="text-[10px] px-1.5 py-0"
-              >
+              <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
                 TB {backendResult.stats.avg.toFixed(2)} ms
               </Badge>
             )}
@@ -420,51 +461,84 @@ export function BenchmarkPanel({
         </TabsList>
 
         <TabsContent value="db">
-          <ResultPanel
-            result={dbResult}
-            error={dbError}
-            loading={dbLoading}
-            returnDesc={returnDesc}
-          />
+          <ResultPanel result={dbResult} error={dbError} loading={dbLoading} returnDesc={returnDesc} />
         </TabsContent>
-
         <TabsContent value="backend">
-          <ResultPanel
-            result={backendResult}
-            error={backendError}
-            loading={backendLoading}
-          />
+          <ResultPanel result={backendResult} error={backendError} loading={backendLoading} />
         </TabsContent>
       </Tabs>
+
+      {/* EXPLAIN ANALYZE section */}
+      <section className="space-y-3">
+        <div className="flex items-center gap-3">
+          <h3 className="text-sm font-semibold">Kế hoạch thực thi (EXPLAIN ANALYZE)</h3>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={fetchExplain}
+            disabled={explainLoading}
+          >
+            {explainLoading ? "Đang phân tích..." : "Phân tích kế hoạch SQL"}
+          </Button>
+        </div>
+        {(explainDb || explainBackend) && (
+          <div className="grid grid-cols-2 gap-4">
+            <ExplainPanel label={tab1Label} plan={explainDb} />
+            <ExplainPanel label={tab2Label} plan={explainBackend} />
+          </div>
+        )}
+      </section>
+
+      {/* Concurrent load test section */}
+      <section className="space-y-3">
+        <div className="flex items-center gap-3 flex-wrap">
+          <h3 className="text-sm font-semibold">Kiểm tra tải đồng thời (Concurrent)</h3>
+          <div className="flex items-center gap-1.5">
+            <Label className="text-sm whitespace-nowrap">Số request song song:</Label>
+            <Input
+              type="number"
+              min={1}
+              max={100}
+              value={concurrency}
+              onChange={(e) => {
+                const n = parseInt(e.target.value, 10);
+                if (!isNaN(n) && n >= 1 && n <= 100) setConcurrency(n);
+              }}
+              className="w-[70px] font-mono text-sm h-9"
+            />
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={hasParams ? () => { pendingActionRef.current = null; setDialogOpen(true); setTimeout(runConcurrent, 500); } : runConcurrent}
+            disabled={concurrentLoading}
+          >
+            {concurrentLoading ? `Đang gửi ${concurrency} request...` : `Gửi ${concurrency} request đồng thời`}
+          </Button>
+        </div>
+        {concurrentResults.length === 2 && (
+          <ConcurrentPanel results={concurrentResults} tab1Label={tab1Label} tab2Label={tab2Label} />
+        )}
+      </section>
     </div>
   );
 }
 
-function TimingBar({
-  label,
-  stats,
-  maxMs,
-  variant,
-}: {
-  label: string;
-  stats: TimingStats;
-  maxMs: number;
-  variant: "db" | "backend";
+// ── Sub-components ────────────────────────────────────────────────────────────
+
+function TimingBar({ label, stats, maxMs, isFaster }: {
+  label: string; stats: TimingStats; maxMs: number; isFaster: boolean;
 }) {
   const pct = maxMs > 0 ? (stats.avg / maxMs) * 100 : 0;
   return (
     <div>
       <div className="flex items-center justify-between text-xs mb-1">
         <span className="text-muted-foreground">{label}</span>
-        <span className="font-mono font-semibold">
-          {stats.avg.toFixed(2)} ms
-        </span>
+        <span className="font-mono font-semibold">{stats.avg.toFixed(2)} ms</span>
       </div>
       <div className="h-3 bg-muted rounded-full overflow-hidden">
         <div
-          className={`h-full rounded-full transition-all ${
-            variant === "db" ? "bg-blue-500" : "bg-amber-500"
-          }`}
+          className={`h-full rounded-full transition-all ${isFaster ? "bg-green-500" : "bg-amber-500"}`}
           style={{ width: `${pct}%` }}
         />
       </div>
@@ -478,33 +552,15 @@ function TimingBar({
   );
 }
 
-function ResultPanel({
-  result,
-  error,
-  loading,
-  returnDesc,
-}: {
-  result: ExecutionResult | null;
-  error: string | null;
-  loading: boolean;
-  returnDesc?: string;
+function ResultPanel({ result, error, loading, returnDesc }: {
+  result: ExecutionResult | null; error: string | null; loading: boolean; returnDesc?: string;
 }) {
   if (loading) {
-    return (
-      <div className="text-center py-8 text-muted-foreground animate-pulse">
-        Đang thực thi...
-      </div>
-    );
+    return <div className="text-center py-8 text-muted-foreground animate-pulse">Đang thực thi...</div>;
   }
-
   if (error) {
-    return (
-      <div className="rounded-lg bg-destructive/10 p-4 text-sm text-destructive">
-        {error}
-      </div>
-    );
+    return <div className="rounded-lg bg-destructive/10 p-4 text-sm text-destructive">{error}</div>;
   }
-
   if (!result) {
     return (
       <div className="text-center py-8 text-muted-foreground text-sm">
@@ -516,46 +572,46 @@ function ResultPanel({
   const isProcedure = result.fields.length === 0;
 
   return (
-    <div className="space-y-3">
-      {/* Iteration stats */}
-      {result.stats.iterations > 1 && (
-        <div className="flex items-center gap-2 flex-wrap text-xs">
-          <Badge variant="secondary" className="font-mono gap-1 font-normal">
-            {result.stats.iterations} lần chạy
-          </Badge>
-          <Badge variant="secondary" className="font-mono gap-1">
-            TB: {result.stats.avg.toFixed(2)} ms
-          </Badge>
-          <Badge variant="secondary" className="font-mono gap-1">
-            Min: {result.stats.min.toFixed(2)} ms
-          </Badge>
-          <Badge variant="secondary" className="font-mono gap-1">
-            Max: {result.stats.max.toFixed(2)} ms
-          </Badge>
+    <div className="space-y-4">
+      {/* Stats */}
+      <div className="flex items-center gap-2 flex-wrap text-xs">
+        {result.stats.iterations > 1 && (
+          <Badge variant="secondary" className="font-mono font-normal">{result.stats.iterations} lần chạy</Badge>
+        )}
+        <Badge variant="secondary" className="font-mono">TB: {result.stats.avg.toFixed(2)} ms</Badge>
+        {result.stats.iterations > 1 && (
+          <>
+            <Badge variant="secondary" className="font-mono">Min: {result.stats.min.toFixed(2)} ms</Badge>
+            <Badge variant="secondary" className="font-mono">Max: {result.stats.max.toFixed(2)} ms</Badge>
+          </>
+        )}
+        <Badge variant="secondary">{result.rowCount ?? 0} dòng</Badge>
+        {returnDesc && <span className="text-muted-foreground">Kết quả: {returnDesc}</span>}
+      </div>
+
+      {/* Cold vs Warm sparkline — only if more than 1 run */}
+      {result.timings.length > 1 && (
+        <div className="rounded-lg border p-3 space-y-1">
+          <div className="text-xs font-medium text-muted-foreground">
+            Biểu đồ thời gian từng lần chạy — lần đầu thường chậm hơn (cold cache)
+          </div>
+          <SparkLine
+            data={result.timings}
+            color={result.fields.length === 0 ? "rgb(168,85,247)" : "rgb(59,130,246)"}
+            height={56}
+          />
         </div>
       )}
 
-      <details className="group">
+      {/* SQL */}
+      <details>
         <summary className="text-xs text-muted-foreground cursor-pointer hover:text-foreground">
           Xem câu lệnh SQL
         </summary>
-        <pre className="mt-2 p-4 rounded-lg bg-muted/50 text-xs font-mono whitespace-pre-wrap">
-          {result.sql}
-        </pre>
+        <pre className="mt-2 p-4 rounded-lg bg-muted/50 text-xs font-mono whitespace-pre-wrap">{result.sql}</pre>
       </details>
 
-      <div className="flex items-center gap-2 flex-wrap">
-        <Badge variant="secondary">
-          TB {result.stats.avg.toFixed(2)} ms
-        </Badge>
-        <Badge variant="secondary">{result.rowCount ?? 0} dòng</Badge>
-        {returnDesc && (
-          <span className="text-xs text-muted-foreground">
-            Kết quả: {returnDesc}
-          </span>
-        )}
-      </div>
-
+      {/* Data */}
       {isProcedure ? (
         <div className="rounded-lg bg-green-500/10 p-4 text-sm text-green-700 dark:text-green-400">
           Thủ tục thực thi thành công. {result.rowCount ?? 0} dòng bị ảnh hưởng.
@@ -563,6 +619,129 @@ function ResultPanel({
       ) : (
         <DataTable fields={result.fields} rows={result.rows} />
       )}
+    </div>
+  );
+}
+
+type PlanNode = {
+  "Node Type": string;
+  "Actual Total Time"?: number;
+  "Actual Rows"?: number;
+  "Plan Rows"?: number;
+  "Total Cost"?: number;
+  "Index Name"?: string;
+  "Relation Name"?: string;
+  Plans?: PlanNode[];
+  [key: string]: unknown;
+};
+
+function ExplainNode({ node, depth = 0 }: { node: PlanNode; depth?: number }) {
+  const [open, setOpen] = useState(depth < 2);
+  const hasChildren = node.Plans && node.Plans.length > 0;
+  const actualTime = node["Actual Total Time"];
+  const actualRows = node["Actual Rows"];
+  const planRows = node["Plan Rows"];
+  const cost = node["Total Cost"];
+  const relation = node["Relation Name"] ?? node["Index Name"];
+
+  return (
+    <div className={`${depth > 0 ? "ml-4 border-l pl-3 border-border/40" : ""}`}>
+      <div
+        className={`flex items-start gap-2 py-1 text-xs ${hasChildren ? "cursor-pointer hover:text-foreground" : ""}`}
+        onClick={() => hasChildren && setOpen((o) => !o)}
+      >
+        {hasChildren && (
+          <span className="text-muted-foreground shrink-0 mt-0.5">{open ? "▼" : "▶"}</span>
+        )}
+        {!hasChildren && <span className="w-3 shrink-0" />}
+        <span>
+          <span className="font-semibold">{node["Node Type"]}</span>
+          {relation && <span className="text-muted-foreground ml-1">on {relation}</span>}
+        </span>
+        <div className="ml-auto flex gap-3 font-mono text-muted-foreground shrink-0">
+          {actualTime !== undefined && (
+            <span className={actualTime > 10 ? "text-amber-500" : "text-green-600"}>
+              {actualTime.toFixed(2)} ms
+            </span>
+          )}
+          {actualRows !== undefined && planRows !== undefined && (
+            <span title="thực tế / ước tính">
+              {actualRows} / {planRows} dòng
+            </span>
+          )}
+          {cost !== undefined && <span>cost={cost.toFixed(1)}</span>}
+        </div>
+      </div>
+      {open && hasChildren && node.Plans?.map((child, i) => (
+        <ExplainNode key={i} node={child} depth={depth + 1} />
+      ))}
+    </div>
+  );
+}
+
+function ExplainPanel({ label, plan }: { label: string; plan: unknown[] | null }) {
+  if (!plan) return (
+    <div className="rounded-xl border p-4 text-xs text-muted-foreground">Chưa có kế hoạch cho {label}</div>
+  );
+
+  const root = (plan[0] as { Plan: PlanNode })?.Plan;
+  if (!root) return null;
+
+  return (
+    <div className="rounded-xl border p-4 space-y-2">
+      <div className="text-sm font-medium">{label}</div>
+      <div className="text-[10px] text-muted-foreground">Thời gian thực / ước tính · dòng thực / ước tính · cost</div>
+      <ExplainNode node={root} />
+    </div>
+  );
+}
+
+function ConcurrentPanel({ results, tab1Label, tab2Label }: {
+  results: ConcurrentResult[]; tab1Label: string; tab2Label: string;
+}) {
+  const labels = [tab1Label, tab2Label];
+  const colors = ["rgb(59,130,246)", "rgb(245,158,11)"];
+  const maxThroughput = Math.max(...results.map((r) => r.throughput));
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-4">
+        {results.map((r, i) => (
+          <div key={r.mode} className="rounded-xl border p-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-medium">{labels[i]}</span>
+              <Badge variant="outline" className="font-mono text-xs">
+                {r.throughput} req/s
+              </Badge>
+            </div>
+            {/* Throughput bar */}
+            <div>
+              <div className="text-[10px] text-muted-foreground mb-1">Throughput</div>
+              <div className="h-2.5 bg-muted rounded-full overflow-hidden">
+                <div
+                  className="h-full rounded-full"
+                  style={{ width: `${maxThroughput > 0 ? (r.throughput / maxThroughput) * 100 : 0}%`, backgroundColor: colors[i] }}
+                />
+              </div>
+            </div>
+            {/* Latency percentiles */}
+            <div className="grid grid-cols-3 gap-2 text-center">
+              {[["P50", r.p50], ["P95", r.p95], ["P99", r.p99]].map(([label, val]) => (
+                <div key={String(label)} className="rounded-lg bg-muted/40 p-2">
+                  <div className="text-[10px] text-muted-foreground">{label}</div>
+                  <div className="font-mono text-sm font-semibold">{Number(val).toFixed(1)}<span className="text-[10px] font-normal text-muted-foreground ml-0.5">ms</span></div>
+                </div>
+              ))}
+            </div>
+            <div className="text-[10px] text-muted-foreground font-mono">
+              Tổng thời gian: {r.totalMs.toFixed(0)} ms · {r.timings.length} thành công · {r.errors} lỗi
+            </div>
+            {r.timings.length > 1 && (
+              <SparkLine data={r.timings} color={colors[i]} height={48} showDots={false} />
+            )}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
